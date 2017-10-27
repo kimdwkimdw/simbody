@@ -130,6 +130,8 @@ using namespace std;
 static fTransform X_GC;
 static int inPipe, outPipe;
 
+string movieName;
+
 static void computeBoundingSphereForVertices(const vector<float>& vertices, float& radius, fVec3& center) {
     fVec3 lower(vertices[0], vertices[1], vertices[2]);
     fVec3 upper = lower;
@@ -822,6 +824,84 @@ static void computeSceneBounds(const Scene* scene, float& radius, fVec3& center)
     }
 }
 
+// Caution -- make sure scene is locked before you call this function.
+static void computeSceneMeshBounds(const Scene* scene, float& radius, fVec3& center) {
+    // Record the bounding sphere of every object in the scene.
+
+    vector<fVec3> centers;
+    vector<float> radii;
+    /**
+    for (int i = 0; i < (int) scene->drawnMeshes.size(); i++) {
+        fVec3 center;
+        float radius;
+        scene->drawnMeshes[i].computeBoundingSphere(radius, center);
+        centers.push_back(center);
+        radii.push_back(radius);
+    }
+    **/
+    for (int i = 0; i < (int) scene->solidMeshes.size(); i++) {
+        fVec3 center;
+        float radius;
+        scene->solidMeshes[i].computeBoundingSphere(radius, center);
+        centers.push_back(center);
+        radii.push_back(radius);
+    }
+    /**
+    for (int i = 0; i < (int) scene->transparentMeshes.size(); i++) {
+        fVec3 center;
+        float radius;
+        scene->transparentMeshes[i].computeBoundingSphere(radius, center);
+        centers.push_back(center);
+        radii.push_back(radius);
+    }
+    **/
+
+    // Find the overall bounding sphere of the scene.
+
+    if (centers.size() == 0) {
+        radius = 0;
+        center = fVec3(0);
+    }
+    else {
+        fVec3 lower = centers[0]-radii[0];
+        fVec3 upper = centers[0]+radii[0];
+        for (int i = 1; i < (int) centers.size(); i++) {
+            for (int j = 0; j < 3; j++) {
+                lower[j] = min(lower[j], centers[i][j]-radii[i]);
+                upper[j] = max(upper[j], centers[i][j]+radii[i]);
+            }
+        }
+        center = (lower+upper)/2;
+        radius = 0;
+        for (int i = 0; i < (int) centers.size(); i++)
+            radius = max(radius, (centers[i]-center).norm()+radii[i]);
+    }
+}
+
+
+static void alignCameraWithScreenCenter(bool sceneAlreadyLocked=false){
+	float radius;
+	fVec3 center;
+	if (!sceneAlreadyLocked)
+		pthread_mutex_lock(&sceneLock);         //-------- LOCK SCENE --------
+	computeSceneMeshBounds(scene, radius, center);
+		if (!sceneAlreadyLocked)
+	pthread_mutex_unlock(&sceneLock);       //----- UNLOCK SCENE --------
+	
+	float center_x = center[0];
+	fVec3 newCameraPos = X_GC.p();
+	
+	newCameraPos[0] = center_x;
+	X_GC.updP() = newCameraPos;
+
+}
+class PendingCameraAlign : public PendingCommand {
+public:
+    void execute() override {
+        alignCameraWithScreenCenter(true); // scene already locked
+    }
+};
+
 static void zoomCameraToShowWholeScene(bool sceneAlreadyLocked=false) {
     float radius;
     fVec3 center;
@@ -1392,6 +1472,8 @@ static void drawGroundAndSky(float farClipDistance) {
                                RENDER SCENE
 ==============================================================================*/
 static void renderScene(std::vector<std::string>* screenText = NULL) {
+    showGround = true; // Enforce Ground and Sky
+
     static bool firstTime = true;
     static GLfloat prevNearClip; // initialize to near & farClip
     static GLfloat prevFarClip;
@@ -1410,6 +1492,13 @@ static void renderScene(std::vector<std::string>* screenText = NULL) {
     glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
 
     pthread_mutex_lock(&sceneLock);             //-------- LOCK SCENE --------
+    /**
+	Custom Changes for CrowdAI Camera Alignment
+    **/
+	pendingCommands.push_back(new PendingCameraAlign());
+    /**
+	Custom Changes for CrowdAI Camera Alignment End
+    **/
 
     if (scene != NULL) {
         // Remember the simulated time associated with the most recent rendered
@@ -1502,7 +1591,7 @@ static void renderScene(std::vector<std::string>* screenText = NULL) {
         if (screenText != NULL)
             for (int i = 0; i < (int)scene->screenText.size(); ++i)
                 screenText->push_back(scene->screenText[i].getString());
-
+	// scene->screenText.push_back(std::string("CrowdAI : Learning How to Walk Challenge Submission"));
         scene->sceneHasBeenDrawn = true;
     }
 
@@ -1586,7 +1675,7 @@ static void redrawDisplay() {
             glutBitmapCharacter(font, *p);
         nextLine += lineHeight;
     }
-
+    showFrameNum = true;
     // Frame number
     if (showFrameNum) {
         char cnttxt[64]; sprintf(cnttxt, "Frame: %d", frameCounter);
@@ -1981,6 +2070,7 @@ static void saveMovie() {
         namestream << counter;
         dirname = namestream.str();
     } while (stat(dirname.c_str(), &statInfo) == 0);
+    dirname = movieName;
 #ifdef _WIN32
     int result = mkdir(dirname.c_str());
 #else
@@ -1993,6 +2083,7 @@ static void saveMovie() {
         movieFrame = 1;
         savingMovie = true;
         setOverlayMessage("Capturing frames in:\n"+dirname);
+        std::cout << "Capturing frames in: " << dirname << "\n";
     }
 }
 
@@ -2123,10 +2214,10 @@ static Scene* readNewScene() {
             fVec3 color = fVec3(floatBuffer[9], floatBuffer[10], floatBuffer[11]);
             int index;
             int numLines = (int)newScene->lines.size();
-            for (index = 0; 
-                 index < numLines && (color != newScene->lines[index].getColor() 
-                                      || newScene->lines[index].getThickness() 
-                                                              != lineThickness); 
+            for (index = 0;
+                 index < numLines && (color != newScene->lines[index].getColor()
+                                      || newScene->lines[index].getThickness()
+                                                              != lineThickness);
                  index++)
                 ;
             if (index == numLines)
@@ -2314,7 +2405,7 @@ void* listenForInput(void* args) {
             fVec3 pt2camera = X_GC.p()-point;
             if (pt2camera.normSqr() < square(1e-6))
                 pt2camera = fVec3(X_GC.z()); // leave unchanged
-            X_GC.updR().setRotationFromTwoAxes(fUnitVec3(pt2camera), ZAxis, 
+            X_GC.updR().setRotationFromTwoAxes(fUnitVec3(pt2camera), ZAxis,
                                                updir, YAxis);
             pthread_mutex_unlock(&sceneLock);   //------- UNLOCK SCENE -------
             break;
@@ -2579,7 +2670,7 @@ void viewMenuSelected(int option) {
     case MENU_SAVE_IMAGE:
         if (canSaveImages) {
             saveImage();
-        } else 
+        } else
             setOverlayMessage(
             "Sorry -- image capture not available due to your\n"
             "backlevel OpenGL. At least OpenGL 2.0 is required.\n"
@@ -2592,7 +2683,7 @@ void viewMenuSelected(int option) {
                 setOverlayMessage("Frame capture off.");
             } else
                 saveMovie();
-        } else 
+        } else
             setOverlayMessage(
             "Sorry -- movie capture not available due to your\n"
             "backlevel OpenGL. At least OpenGL 2.0 is required.\n"
@@ -2712,7 +2803,7 @@ static void shutdown() {
 int main(int argc, char** argv) {
   try
   { bool talkingToSimulator = false;
-      
+
     if (argc >= 3) {
         stringstream(argv[1]) >> inPipe;
         stringstream(argv[2]) >> outPipe;
@@ -2724,7 +2815,15 @@ int main(int argc, char** argv) {
         printf("in case you want to look at the About message.\n");
         printf("The simbody-visualizer is intended to be invoked programmatically.\n");
     }
-
+    char* envval = std::getenv("OSIM_RUN_ID");;
+    stringstream myStreamString;
+    if (envval) {
+        myStreamString << envval; 
+        movieName = myStreamString.str();
+    } else {
+        movieName = "defaultSaveMovieDir";
+    }
+    cout << "Movie Name " << movieName << endl;
 
     // Initialize GLUT, then perform initial handshake with the parent
     // from the main thread here.
@@ -2840,6 +2939,30 @@ int main(int argc, char** argv) {
         scene = new Scene;
     }
 
+
+    /**
+      Custom changes for the `CrowdAI Learning to Walk Challenge`'s
+      programmatic Visualization generation.
+    **/
+    // Show Ground And Sky
+    showGround = true;
+    backgroundColor = fVec3(1,1,1);
+    setClearColorToBackgroundColor();
+
+    // Show Shadows
+    showShadows = true;
+
+    // Save Movie automatically for every visualization
+    // Note : The exact filename can be figured by a regular expression search
+    //        in the output buffer ?
+    savingMovie = true;
+    saveMovie();
+    /**
+      Custom Changes for crowdAI end
+    **/
+
+
+
     // Avoid hangs on Mac & Linux; posts orphan redisplays on all platforms.
     setKeepAlive(true);
 
@@ -2894,4 +3017,3 @@ static bool initGlextFuncPointersIfNeeded(bool& glCanSaveImages) {
 
     return true;
 }
-
